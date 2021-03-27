@@ -59,7 +59,6 @@ class ScanNetDataset(MonoDataset):
 
         for i in self.frame_idxs:
             inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, None, do_flip)
-            inputs[("bev", i)] = self.to_tensor(self.get_bev(folder, frame_index + i, do_flip)) / 255.0
             inputs[("pose", i)] = torch.from_numpy(self.get_pose(folder, frame_index + i, do_flip))
 
         # adjusting intrinsics to match each scale in the pyramid
@@ -152,22 +151,6 @@ class ScanNetDataset(MonoDataset):
             pass #todo implement flip for pose
 
         return pose
-
-    def get_bev(self, folder, frame_index, do_flip):
-        image_path = os.path.join(
-            self.data_path,
-            "bev",
-            folder,
-            "{}.png".format(frame_index))
-
-        with open(image_path, 'rb') as f:
-            with Image.open(f) as img:
-                bev = img.convert('L')
-
-        if do_flip:
-            bev = bev.transpose(pil.FLIP_LEFT_RIGHT)
-
-        return bev
 
     def get_depth(self, folder, frame_index, side, do_flip):
         depth_path = os.path.join(
