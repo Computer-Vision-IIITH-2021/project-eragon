@@ -1,16 +1,15 @@
 from __future__ import absolute_import, division, print_function
 
 import os
-import skimage.transform
 import numpy as np
 import PIL.Image as pil
 import random
 import torch
 from torchvision import transforms
 
-from kitti_utils import generate_depth_map
-from .mono_dataset import MonoDataset
-from PIL import Image
+from datasets.mono_dataset import MonoDataset
+
+from datasets.keypt_extractors import get_keypts
 
 
 class ScanNetDataset(MonoDataset):
@@ -20,6 +19,7 @@ class ScanNetDataset(MonoDataset):
         super(ScanNetDataset, self).__init__(*args, **kwargs)
 
         self.full_res_shape = (1296, 968)
+        self.num_pts = 3000
 
     def __getitem__(self, index):
         """Returns a single training item from the dataset as a dictionary.
@@ -60,6 +60,27 @@ class ScanNetDataset(MonoDataset):
         for i in self.frame_idxs:
             inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, None, do_flip)
             inputs[("pose", i)] = torch.from_numpy(self.get_pose(folder, frame_index + i, do_flip))
+
+        img = np.array(inputs[("color", 0, -1)])
+        keypts = get_keypts(img, "orb").astype(np.int32)
+        keypts[:, 0] = keypts[:, 0] * self.width // self.full_res_shape[0]
+        keypts[:, 1] = keypts[:, 1] * self.height // self.full_res_shape[1]
+
+        remaining_pts = self.num_pts - keypts.shape[0]
+        if remaining_pts > 0:
+            random_pts = np.zeros((remaining_pts, 2), dtype=np.int32)
+            random_pts[:, 0] = np.random.randint(0, self.width, remaining_pts)
+            random_pts[:, 1] = np.random.randint(0, self.height, remaining_pts)
+        else:
+            random_pts = np.array([[], []], dtype=np.int32).T
+
+        all_pts = np.concatenate([keypts, random_pts], axis=0)[:self.num_pts, :]
+
+        pt_mask = np.zeros((self.height, self.width), dtype=np.int32)
+        pt_mask[all_pts[:, 1], all_pts[:, 0]] = 1
+
+        inputs["keypts"] = torch.from_numpy(all_pts).float()
+        # inputs["keypt_mask"] = torch.from_numpy(pt_mask).float()
 
         # adjusting intrinsics to match each scale in the pyramid
         K = self.get_K(folder, np.array(inputs[("color", 0, -1)]).shape)
@@ -168,3 +189,36 @@ class ScanNetDataset(MonoDataset):
             depth_gt = np.fliplr(depth_gt)
 
         return depth_gt
+
+
+if __name__ == '__main__':
+    data_path = '/mnt/storage2/data/scannet'
+    filenames = ['scene0048_01 76', 'scene0048_01 38', 'scene0048_01 31', 'scene0048_01 9', 'scene0048_01 53',
+                 'scene0048_01 106', 'scene0048_01 88', 'scene0048_01 61', 'scene0048_01 82', 'scene0048_01 58',
+                 'scene0048_01 28', 'scene0048_01 102', 'scene0048_01 66', 'scene0048_01 125', 'scene0048_01 60',
+                 'scene0048_01 5', 'scene0048_01 93', 'scene0048_01 87', 'scene0048_01 114', 'scene0048_01 99',
+                 'scene0048_01 80', 'scene0048_01 6', 'scene0048_01 105', 'scene0048_01 62', 'scene0048_01 57',
+                 'scene0048_01 50', 'scene0048_01 27', 'scene0048_01 73', 'scene0048_01 126', 'scene0048_01 67',
+                 'scene0048_01 54', 'scene0048_01 85', 'scene0048_01 13', 'scene0048_01 7', 'scene0048_01 113',
+                 'scene0048_01 68', 'scene0048_01 17', 'scene0048_01 117', 'scene0048_01 1', 'scene0048_01 70',
+                 'scene0048_01 26', 'scene0048_01 48', 'scene0048_01 15', 'scene0048_01 45', 'scene0048_01 132',
+                 'scene0048_01 71', 'scene0048_01 130', 'scene0048_01 25', 'scene0048_01 29', 'scene0048_01 3',
+                 'scene0048_01 19', 'scene0048_01 78', 'scene0048_01 97', 'scene0048_01 2', 'scene0048_01 77',
+                 'scene0048_01 81', 'scene0048_01 90', 'scene0048_01 101', 'scene0048_01 94', 'scene0048_01 44',
+                 'scene0048_01 8', 'scene0048_01 95', 'scene0048_01 32', 'scene0048_01 21', 'scene0048_01 131',
+                 'scene0048_01 112', 'scene0048_01 11', 'scene0048_01 127', 'scene0048_01 23', 'scene0048_01 98',
+                 'scene0048_01 104', 'scene0048_01 63', 'scene0048_01 111', 'scene0048_01 128', 'scene0048_01 52',
+                 'scene0048_01 49', 'scene0048_01 72', 'scene0048_01 96', 'scene0048_01 79', 'scene0048_01 103',
+                 'scene0048_01 24', 'scene0048_01 22', 'scene0048_01 42', 'scene0048_01 40', 'scene0048_01 119']
+    width, height = 384, 288
+    frame_idxs = [0, -1, 1]
+    num_scales = 4
+    is_train = True
+
+    dataset = ScanNetDataset(data_path=data_path, filenames=filenames,
+                             height=height, width=width,
+                             frame_idxs=frame_idxs, num_scales=num_scales,
+                             is_train=is_train)
+
+    data = dataset[0]
+    print()
