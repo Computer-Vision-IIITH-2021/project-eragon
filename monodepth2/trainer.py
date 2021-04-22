@@ -572,7 +572,15 @@ class Trainer:
             loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
 
             # Planar consistency term
-            # TODO: Implement
+            loss_planar_depth = 0.0
+            for frame_id in [0]:
+                pred_depth = outputs[("depth", frame_id, scale)]
+                planar_depth = outputs[("planar_depth", frame_id, scale)]
+                planar_mask = outputs[("planar_mask", frame_id, scale)]
+
+                loss_planar_depth += torch.mean(torch.abs(pred_depth - planar_depth) * planar_mask)
+            loss += loss_planar_depth * self.opt.lambda_planar_depth
+            losses["planar_reg_loss/{}".format(scale)] = loss_planar_depth
 
             # loss per scale
             losses["loss/{}".format(scale)] = loss

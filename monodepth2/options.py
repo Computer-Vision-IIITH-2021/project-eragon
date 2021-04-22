@@ -203,6 +203,11 @@ class MonodepthOptions:
                                       "from the original monodepth paper",
                                  action="store_true")
 
+        self.parser.add_argument("--lambda_planar_depth",
+                                 help="weights for planar consistency term in the loss",
+                                 type=float,
+                                 default=0.05)
+
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options
