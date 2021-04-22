@@ -48,7 +48,7 @@ class ScanNetDataset(MonoDataset):
         inputs = {}
 
         do_color_aug = self.is_train and random.random() > 0.5
-        do_flip = False  #self.is_train and random.random() > 0.5 #todo implement flip for get_pose
+        do_flip = self.is_train and random.random() > 0.5
 
         line = self.filenames[index].split()
         folder = line[0]
@@ -59,7 +59,8 @@ class ScanNetDataset(MonoDataset):
 
         for i in self.frame_idxs:
             inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, None, do_flip)
-            inputs[("pose", i)] = torch.from_numpy(self.get_pose(folder, frame_index + i, do_flip))
+
+        inputs[("segment", 0, 0)] = self.to_tensor(self.get_segment(folder, frame_index, do_flip)).long() + 1
 
         img = np.array(inputs[("color", 0, -1)])
         keypts = get_keypts(img, "orb").astype(np.int32)
@@ -172,6 +173,20 @@ class ScanNetDataset(MonoDataset):
             pass #todo implement flip for pose
 
         return pose
+
+    def get_segment(self, folder, frame_index, do_flip):
+        seg_path = os.path.join(
+            self.data_path,
+            "superpixels",
+            folder,
+            "seg_{}.npz".format(frame_index))
+
+        segment = np.load(seg_path)['segment_0']
+
+        if do_flip:
+            segment = np.fliplr(segment)
+
+        return segment
 
     def get_depth(self, folder, frame_index, side, do_flip):
         depth_path = os.path.join(
