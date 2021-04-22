@@ -145,7 +145,7 @@ class Trainer:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
         if not self.opt.no_ssim:
-            self.ssim = SSIM()
+            self.ssim = SSIM(sparse=True)
             self.ssim.to(self.device)
 
         self.backproject_depth = {}
@@ -256,8 +256,8 @@ class Trainer:
         if self.use_pose_net:
             outputs.update(self.predict_poses(inputs, features))
 
-        self.generate_images_pred(inputs, outputs)
-        losses = self.compute_losses(inputs, outputs)
+        self.generate_sparse_pred(inputs, outputs)
+        losses = self.compute_sparse_losses(inputs, outputs)
 
         return outputs, losses
 
@@ -340,6 +340,138 @@ class Trainer:
 
         self.set_train()
 
+    def generate_planar_depth(self, inputs, outputs, frame_id, scale):
+        source_scale = 0
+        depth = outputs[("depth", frame_id, scale)]
+
+        cam_points = self.backproject_depth[source_scale](
+            depth, inputs[("inv_K", source_scale)])
+
+        # superpixel pooling, superpixel index start from one
+        # todo currently only use one scale segment results
+        superpixel = inputs[('segment', frame_id, 0)].long() - 1
+        max_num = superpixel.max().item() + 1
+
+        sum_points = torch.zeros((self.opt.batch_size, max_num, 3)).to(self.device)
+        area = torch.zeros((self.opt.batch_size, max_num)).to(self.device)
+        for channel in range(3):
+            points_channel = sum_points[:, :, channel]
+            points_channel = points_channel.reshape(self.opt.batch_size, -1)
+            points_channel.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
+                                        cam_points[:, channel, ...].view(self.opt.batch_size, -1))
+
+        area.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
+                          torch.ones_like(depth).view(self.opt.batch_size, -1))
+
+        # X^T X
+        cam_points_tmp = cam_points[:, :3, :]
+        x_T_dot_x = (cam_points_tmp.unsqueeze(1) * cam_points_tmp.unsqueeze(2)).view(self.opt.batch_size, 9, -1)
+        X_T_dot_X = torch.zeros((self.opt.batch_size, max_num, 9)).cuda()
+        for channel in range(9):
+            points_channel = X_T_dot_X[:, :, channel]
+            points_channel = points_channel.reshape(self.opt.batch_size, -1)
+            points_channel.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
+                                        x_T_dot_x[:, channel, ...].view(self.opt.batch_size, -1))
+        xTx = X_T_dot_X.view(self.opt.batch_size, max_num, 3, 3)
+
+        # take inverse
+        xTx_inv = torch.inverse(
+            xTx.view(-1, 3, 3) + 0.01 * torch.eye(3).view(1, 3, 3).expand(self.opt.batch_size * max_num, 3, 3).cuda())
+        xTx_inv = xTx_inv.view(xTx.shape)
+
+        xTx_inv_xT = torch.matmul(xTx_inv, sum_points.unsqueeze(3))
+        plane_parameters = xTx_inv_xT.squeeze(3)
+
+        # outputs[("fitted_parameters", frame_id, scale)] = plane_parameters
+
+        # generate mask for superpixel with area larger than 200
+        valid_mask = (area > 1000.).float()
+        planar_mask = torch.gather(valid_mask, 1, superpixel.view(self.opt.batch_size, -1))
+        planar_mask = planar_mask.view(self.opt.batch_size, 1, self.opt.height, self.opt.width)
+        outputs[("planar_mask", frame_id, scale)] = planar_mask
+
+        # superpixel unpooling
+        unpooled_parameters = []
+        for channel in range(3):
+            pooled_parameters_channel = plane_parameters[:, :, channel]
+            pooled_parameters_channel = pooled_parameters_channel.reshape(self.opt.batch_size, -1)
+            unpooled_parameter = torch.gather(pooled_parameters_channel, 1, superpixel.view(self.opt.batch_size, -1))
+            unpooled_parameters.append(unpooled_parameter.view(self.opt.batch_size, 1, self.opt.height, self.opt.width))
+        unpooled_parameters = torch.cat(unpooled_parameters, dim=1)
+
+        # recover depth from plane parameters
+        K_inv_dot_xy1 = torch.matmul(inputs[("inv_K", source_scale)][:, :3, :3],
+                                     self.backproject_depth[source_scale].pix_coords)
+        depth = 1. / (torch.sum(K_inv_dot_xy1 * unpooled_parameters.view(self.opt.batch_size, 3, -1), dim=1) + 1e-6)
+
+        # clip depth range
+        depth = torch.clamp(depth, self.opt.min_depth, self.opt.max_depth)
+        depth = depth.view(self.opt.batch_size, 1, self.opt.height, self.opt.width)
+        outputs[("planar_depth", frame_id, scale)] = depth
+
+    def generate_sparse_pred(self, inputs, outputs):
+        """Generate the warped (reprojected) color images for a minibatch.
+        Generated images are saved into the `outputs` dictionary.
+        """
+
+        for scale in self.opt.scales:
+            disp = outputs[("disp", 0, scale)]
+            disp = F.interpolate(
+                disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+            source_scale = 0
+
+            _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+
+            outputs[("depth", 0, scale)] = depth
+
+            self.generate_planar_depth(inputs, outputs, 0, scale)
+
+            # sample depth for dso points
+            keypts = inputs['keypts'].T
+
+            flat = (keypts[:, 0] + keypts[:, 1] * self.opt.width).long()
+            keypts_depth = torch.gather(depth.view(self.opt.batch_size, -1), 1, flat)
+
+            # generate pattern
+            meshgrid = np.meshgrid([-2, 0, 2], [-2, 0, 2], indexing='xy')
+            meshgrid = np.stack(meshgrid, axis=0).astype(np.float32)
+            meshgrid = torch.from_numpy(meshgrid).to(keypts.device).permute(1, 2, 0).view(1, 1, 9, 2)
+            keypts = keypts.unsqueeze(2) + meshgrid
+            keypts = keypts.reshape(self.opt.batch_size, -1, 2)
+            keypts_depth = keypts_depth.view(self.opt.batch_size, -1, 1).expand(-1, -1, 9).reshape(self.opt.batch_size, 1, -1)
+
+            # convert to point cloud
+            xy1 = torch.cat((keypts, torch.ones_like(keypts[:, :, :1])), dim=2)
+            xy1 = xy1.permute(0, 2, 1)
+            cam_points = (inputs[("inv_K", source_scale)][:, :3, :3] @ xy1) * keypts_depth
+            points = torch.cat((cam_points, torch.ones_like(cam_points[:, :1, :])), dim=1)
+            outputs[("cam_T_cam", 0, 0)] = torch.eye(4).view(1, 4, 4).expand(self.opt.batch_size, 4, 4).cuda()
+
+            for frame_id in self.opt.frame_ids:
+                T = outputs[("cam_T_cam", 0, frame_id)]
+
+                # projects to different frames
+                P = torch.matmul(inputs[("K", source_scale)], T)[:, :3, :]
+                cam_points = torch.matmul(P, points)
+
+                pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + 1e-7)
+                pix_coords = pix_coords.view(self.opt.batch_size, 2, -1, 9)
+                pix_coords = pix_coords.permute(0, 2, 3, 1)
+                pix_coords[..., 0] /= self.opt.width - 1
+                pix_coords[..., 1] /= self.opt.height - 1
+                pix_coords = (pix_coords - 0.5) * 2
+
+                # save mask
+                valid = (pix_coords[..., 0] > -1.) & (pix_coords[..., 0] < 1.) & (pix_coords[..., 1] > -1.) & (
+                        pix_coords[..., 1] < 1.)
+                outputs[("keypts_mask", frame_id, scale)] = valid.unsqueeze(1).float()
+
+                # sample patch from color images
+                outputs[("keypts_color", frame_id, scale)] = F.grid_sample(
+                    inputs[("color", frame_id, source_scale)],
+                    pix_coords,
+                    padding_mode="border")
+
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
@@ -405,6 +537,52 @@ class Trainer:
             reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
         return reprojection_loss
+
+    def compute_sparse_losses(self, inputs, outputs):
+        losses = {}
+        total_loss = 0
+
+        for scale in self.opt.scales:
+            loss = 0
+            sparse_reproj_losses = []
+
+            source_scale = 0
+            disp = outputs[("disp", scale)]
+            color = inputs[("color", 0, scale)]
+            target = inputs[("keypts_color", 0, source_scale)]
+
+            # Reprojection Term
+            for frame_id in self.opt.frame_ids[1:]:
+                pred = outputs[("keypts_color", frame_id, scale)]
+                sparse_reproj_losses.append(self.compute_reprojection_loss(pred, target))
+
+            keypt_color_loss, _ = torch.min(torch.cat(sparse_reproj_losses, dim=1), dim=1)
+            keypt_color_loss = keypt_color_loss.mean()
+            losses["keypt_color_loss/{}".format(scale)] = keypt_color_loss
+
+            loss += keypt_color_loss
+
+            # Smoothness Term
+            mean_disp = disp.mean(2, True).mean(3, True)
+            norm_disp = disp / (mean_disp + 1e-7)
+            smooth_loss = get_smooth_loss(norm_disp, color)
+
+            losses["smooth loss/{}".format(scale)] = smooth_loss
+
+            loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
+
+            # Planar consistency term
+            # TODO: Implement
+
+            # loss per scale
+            losses["loss/{}".format(scale)] = loss
+
+            # Total loss
+            total_loss += loss
+
+        total_loss /= self.num_scales
+        losses["loss"] = total_loss
+        return losses
 
     def compute_losses(self, inputs, outputs):
         """Compute the reprojection and smoothness losses for a minibatch

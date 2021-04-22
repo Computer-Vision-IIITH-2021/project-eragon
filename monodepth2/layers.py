@@ -218,13 +218,21 @@ def get_smooth_loss(disp, img):
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
     """
-    def __init__(self):
+    def __init__(self, sparse=False):
         super(SSIM, self).__init__()
-        self.mu_x_pool   = nn.AvgPool2d(3, 1)
-        self.mu_y_pool   = nn.AvgPool2d(3, 1)
-        self.sig_x_pool  = nn.AvgPool2d(3, 1)
-        self.sig_y_pool  = nn.AvgPool2d(3, 1)
-        self.sig_xy_pool = nn.AvgPool2d(3, 1)
+        self.sparse = sparse
+        if self.sparse:
+            self.mu_x_pool = nn.AvgPool2d((1, 9), 1)
+            self.mu_y_pool = nn.AvgPool2d((1, 9), 1)
+            self.sig_x_pool = nn.AvgPool2d((1, 9), 1)
+            self.sig_y_pool = nn.AvgPool2d((1, 9), 1)
+            self.sig_xy_pool = nn.AvgPool2d((1, 9), 1)
+        else:
+            self.mu_x_pool   = nn.AvgPool2d(3, 1)
+            self.mu_y_pool   = nn.AvgPool2d(3, 1)
+            self.sig_x_pool  = nn.AvgPool2d(3, 1)
+            self.sig_y_pool  = nn.AvgPool2d(3, 1)
+            self.sig_xy_pool = nn.AvgPool2d(3, 1)
 
         self.refl = nn.ReflectionPad2d(1)
 
@@ -232,8 +240,9 @@ class SSIM(nn.Module):
         self.C2 = 0.03 ** 2
 
     def forward(self, x, y):
-        x = self.refl(x)
-        y = self.refl(y)
+        if not self.sparse:
+            x = self.refl(x)
+            y = self.refl(y)
 
         mu_x = self.mu_x_pool(x)
         mu_y = self.mu_y_pool(y)
