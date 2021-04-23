@@ -2,12 +2,16 @@ import cv2
 import numpy as np
 
 
+orb_extractor = cv2.ORB_create()
+sift_extractor = cv2.SIFT_create()
+
+
 def get_keypts(img, extractor='orb'):
 
     if extractor == 'orb':
-        extractor = cv2.ORB_create()
+        extractor = orb_extractor
     elif extractor == 'sift':
-        extractor = cv2.SIFT_create()
+        extractor = sift_extractor
     else:
         raise NotImplementedError('Extractor not found.')
 

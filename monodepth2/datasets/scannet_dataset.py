@@ -65,11 +65,14 @@ class ScanNetDataset(MonoDataset):
 
         img = np.array(inputs[("color", 0, -1)])
         keypts = get_keypts(img, "orb").astype(np.int32)
-        print("No keypoints detected for {}".format(line))
+        if keypts.shape[0] == 0:
+            keypts = get_keypts(img, "sift").astype(np.int32)  # slower, so used as fallback
+
         if keypts.shape[0] != 0:
             keypts[:, 0] = keypts[:, 0] * self.width // self.full_res_shape[0]
             keypts[:, 1] = keypts[:, 1] * self.height // self.full_res_shape[1]
         else:
+            print("No keypoints detected for {}".format(line))
             keypts = np.array([[], []], dtype=np.int32).T
 
         remaining_pts = self.num_pts - keypts.shape[0]
