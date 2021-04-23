@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import numpy as np
 import PIL.Image as pil
+import cv2
 import random
 import torch
 from torchvision import transforms
@@ -64,8 +65,12 @@ class ScanNetDataset(MonoDataset):
 
         img = np.array(inputs[("color", 0, -1)])
         keypts = get_keypts(img, "orb").astype(np.int32)
-        keypts[:, 0] = keypts[:, 0] * self.width // self.full_res_shape[0]
-        keypts[:, 1] = keypts[:, 1] * self.height // self.full_res_shape[1]
+        print("No keypoints detected for {}".format(line))
+        if keypts.shape[0] != 0:
+            keypts[:, 0] = keypts[:, 0] * self.width // self.full_res_shape[0]
+            keypts[:, 1] = keypts[:, 1] * self.height // self.full_res_shape[1]
+        else:
+            keypts = np.array([[], []], dtype=np.int32).T
 
         remaining_pts = self.num_pts - keypts.shape[0]
         if remaining_pts > 0:
@@ -183,8 +188,10 @@ class ScanNetDataset(MonoDataset):
 
         segment = np.load(seg_path)['segment_0']
 
+        segment = cv2.resize(segment, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+
         if do_flip:
-            segment = np.fliplr(segment)
+            segment = cv2.flip(segment, 1)
 
         return segment
 
