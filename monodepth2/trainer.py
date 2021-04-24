@@ -344,75 +344,82 @@ class Trainer:
         source_scale = 0
         depth = outputs[("depth", frame_id, scale)]
 
+        # Generate the 3D Point cloud using the predicted depth
         cam_points = self.backproject_depth[source_scale](
             depth, inputs[("inv_K", source_scale)])
 
-        # superpixel pooling, superpixel index start from one
-        # todo currently only use one scale segment results
-        superpixel = inputs[('segment', frame_id, 0)].long() - 1
-        max_num = superpixel.max().item() + 1
+        superpixel = inputs[('segment', frame_id, 0)].long()
+        # Superpixels indexing starts from 1.
+        num_superpixels = superpixel.max().item()
 
-        sum_points = torch.zeros((self.opt.batch_size, max_num, 3)).to(self.device)
-        area = torch.zeros((self.opt.batch_size, max_num)).to(self.device)
+        # Compute area of each superpixel
+        area = torch.zeros((self.opt.batch_size, num_superpixels)).to(self.device)
+        area.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
+                          torch.ones_like(depth).view(self.opt.batch_size, -1))
+
+        # Generate mask for superpixel with area larger than 200
+        valid_superpixels = (area > 1000.).float()
+        planar_mask = torch.gather(valid_superpixels, 1, superpixel.view(self.opt.batch_size, -1))
+        planar_mask = planar_mask.view(self.opt.batch_size, 1, self.opt.height, self.opt.width)
+        outputs[("planar_mask", frame_id, scale)] = planar_mask
+
+        # Compute PY where P is the vector of 3D points belonging to a superpixel and Y is the one vector
+        sum_points = torch.zeros((self.opt.batch_size, num_superpixels, 3)).to(self.device)
         for channel in range(3):
             points_channel = sum_points[:, :, channel]
             points_channel = points_channel.reshape(self.opt.batch_size, -1)
             points_channel.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
                                         cam_points[:, channel, ...].view(self.opt.batch_size, -1))
 
-        area.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
-                          torch.ones_like(depth).view(self.opt.batch_size, -1))
+        cam_points_tmp = cam_points[:, :3, :]  # Ignoring the last column of homogeneous coords (x,y,z,1)
 
-        # X^T X
-        cam_points_tmp = cam_points[:, :3, :]
+        # Computing x^2, xy, xz, yx, y^2, yz, zx, zy, z^2 terms
         x_T_dot_x = (cam_points_tmp.unsqueeze(1) * cam_points_tmp.unsqueeze(2)).view(self.opt.batch_size, 9, -1)
-        X_T_dot_X = torch.zeros((self.opt.batch_size, max_num, 9)).cuda()
+
+        # Using the above to compute PtP for each superpixel.
+        X_T_dot_X = torch.zeros((self.opt.batch_size, num_superpixels, 9)).cuda()
         for channel in range(9):
             points_channel = X_T_dot_X[:, :, channel]
             points_channel = points_channel.reshape(self.opt.batch_size, -1)
             points_channel.scatter_add_(1, superpixel.view(self.opt.batch_size, -1),
                                         x_T_dot_x[:, channel, ...].view(self.opt.batch_size, -1))
-        xTx = X_T_dot_X.view(self.opt.batch_size, max_num, 3, 3)
+        xTx = X_T_dot_X.view(self.opt.batch_size, num_superpixels, 3, 3)
 
-        # take inverse
+        # Compute the inverse of PtP
         xTx_inv = torch.inverse(
-            xTx.view(-1, 3, 3) + 0.01 * torch.eye(3).view(1, 3, 3).expand(self.opt.batch_size * max_num, 3, 3).cuda())
+            xTx.view(-1, 3, 3) + 0.01 * torch.eye(3).view(1, 3, 3).expand(
+                self.opt.batch_size * num_superpixels, 3, 3).cuda())
         xTx_inv = xTx_inv.view(xTx.shape)
 
+        # Multiply the above with PY to get the plane parameters
         xTx_inv_xT = torch.matmul(xTx_inv, sum_points.unsqueeze(3))
         plane_parameters = xTx_inv_xT.squeeze(3)
 
-        # outputs[("fitted_parameters", frame_id, scale)] = plane_parameters
-
-        # generate mask for superpixel with area larger than 200
-        valid_mask = (area > 1000.).float()
-        planar_mask = torch.gather(valid_mask, 1, superpixel.view(self.opt.batch_size, -1))
-        planar_mask = planar_mask.view(self.opt.batch_size, 1, self.opt.height, self.opt.width)
-        outputs[("planar_mask", frame_id, scale)] = planar_mask
-
-        # superpixel unpooling
-        unpooled_parameters = []
+        # Storing plane parameters per pixel
+        plane_parameters_per_pixel = []
         for channel in range(3):
-            pooled_parameters_channel = plane_parameters[:, :, channel]
-            pooled_parameters_channel = pooled_parameters_channel.reshape(self.opt.batch_size, -1)
-            unpooled_parameter = torch.gather(pooled_parameters_channel, 1, superpixel.view(self.opt.batch_size, -1))
-            unpooled_parameters.append(unpooled_parameter.view(self.opt.batch_size, 1, self.opt.height, self.opt.width))
-        unpooled_parameters = torch.cat(unpooled_parameters, dim=1)
+            plane_parameters_channel = plane_parameters[:, :, channel]
+            plane_parameters_channel = plane_parameters_channel.reshape(self.opt.batch_size, -1)
+            flattened_plane_params_per_pixel = torch.gather(plane_parameters_channel, 1,
+                                                            superpixel.view(self.opt.batch_size, -1))
+            plane_parameters_per_pixel.append(flattened_plane_params_per_pixel.view(self.opt.batch_size,
+                                                                                    1, self.opt.height, self.opt.width))
+        plane_parameters_per_pixel = torch.cat(plane_parameters_per_pixel, dim=1)
 
-        # recover depth from plane parameters
+        # Compute depth from plane parameters
+        # PA = 1 where P = D * inv_K @ xy
+        # P - point cloud vectors, D - depth, xy - homogeneous pixel coords, A - plane parameters
+        # D = 1 / (inv_K @ xy) * A
         K_inv_dot_xy1 = torch.matmul(inputs[("inv_K", source_scale)][:, :3, :3],
                                      self.backproject_depth[source_scale].pix_coords)
-        depth = 1. / (torch.sum(K_inv_dot_xy1 * unpooled_parameters.view(self.opt.batch_size, 3, -1), dim=1) + 1e-6)
+        depth = 1. / (torch.sum(K_inv_dot_xy1 * plane_parameters_per_pixel.view(self.opt.batch_size, 3, -1), dim=1) + 1e-6)
 
-        # clip depth range
+        # Clip depth to be between min and max depth
         depth = torch.clamp(depth, self.opt.min_depth, self.opt.max_depth)
         depth = depth.view(self.opt.batch_size, 1, self.opt.height, self.opt.width)
         outputs[("planar_depth", frame_id, scale)] = depth
 
     def generate_sparse_pred(self, inputs, outputs):
-        """Generate the warped (reprojected) color images for a minibatch.
-        Generated images are saved into the `outputs` dictionary.
-        """
 
         for scale in self.opt.scales:
             disp = outputs[("disp", 0, scale)]

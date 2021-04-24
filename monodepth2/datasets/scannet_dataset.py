@@ -61,7 +61,7 @@ class ScanNetDataset(MonoDataset):
         for i in self.frame_idxs:
             inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, None, do_flip)
 
-        inputs[("segment", 0, 0)] = self.to_tensor(self.get_segment(folder, frame_index, do_flip)).long() + 1
+        inputs[("segment", 0, 0)] = self.to_tensor(self.get_segment(folder, frame_index, do_flip)).long()
 
         img = np.array(inputs[("color", 0, -1)])
         keypts = get_keypts(img, "orb").astype(np.int32)
